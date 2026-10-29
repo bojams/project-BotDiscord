@@ -1,12 +1,15 @@
 import os
 import asyncio
-import discord
-from discord.ext import commands
-from discord.ui import View, Button
-from dotenv import load_dotenv
-import yt_dlp
+import threading
 from collections import deque
-from functools import lru_cache
+from dataclasses import dataclass
+from urllib.parse import parse_qs, urlparse
+
+import discord
+import yt_dlp
+from discord.ext import commands
+from discord.ui import View
+from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -30,24 +33,40 @@ bot = commands.Bot(
 # Bounded queues = prevent memory leaks
 MAX_QUEUE = 50
 MAX_HISTORY = 20
+OPUS_BITRATE = 128000
 
 queues = {}
 history = {}
 voice_clients = {}
 loop_modes = {}
 
-# Single shared ytdl instance (thread-safe via executor)
-_ytdl = yt_dlp.YoutubeDL({
+# yt-dlp: satu ekstraksi pada satu waktu agar hemat CPU/RAM
+_BASE_YDL_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'cachedir': False,
+    'socket_timeout': 15,
+    'source_address': '0.0.0.0',
+}
+
+SINGLE_YDL_OPTS = {
+    **_BASE_YDL_OPTS,
     'format': 'bestaudio/best',
     'noplaylist': True,
-    'quiet': True,
-    'default_search': 'ytsearch',
-    'source_address': '0.0.0.0',
-    'cachedir': False,
-    'no_warnings': True,
+    'default_search': 'ytsearch1',
     'extract_flat': False,
-    'socket_timeout': 10,
-})
+}
+
+PLAYLIST_YDL_OPTS = {
+    **_BASE_YDL_OPTS,
+    'format': 'bestaudio/best',
+    'noplaylist': False,
+    'extract_flat': 'in_playlist',
+    'playlistend': MAX_QUEUE,
+    'ignoreerrors': True,
+}
+
+_YDL_LOCK = threading.Lock()
 
 # FFmpeg optimized for low CPU - no resampling filter
 FFMPEG_OPTIONS = {
@@ -55,9 +74,137 @@ FFMPEG_OPTIONS = {
     'options': '-vn -b:a 128k -ar 48000 -ac 2',
 }
 
+
+def _is_youtube_host(host):
+    host = (host or '').lower()
+    return host == 'youtube.com' or host.endswith('.youtube.com') or host == 'youtu.be'
+
+
+def _normalize_track_url(url, video_id=None):
+    """Ubah link YouTube/YouTube Music menjadi URL video yang bersih."""
+    if not url:
+        return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+
+    if not url.startswith(('http://', 'https://')):
+        return f"https://www.youtube.com/watch?v={video_id}" if video_id else url
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+
+    if host == 'youtu.be':
+        video_id = parsed.path.strip('/').split('/')[0] or video_id
+    elif _is_youtube_host(host):
+        video_id = parse_qs(parsed.query).get('v', [None])[0] or video_id
+
+    if video_id and _is_youtube_host(host):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
+def is_playlist_url(query):
+    """Deteksi link playlist YouTube / YouTube Music."""
+    if not query.startswith(('http://', 'https://')):
+        return False
+
+    parsed = urlparse(query)
+    host = parsed.netloc.lower()
+    if not _is_youtube_host(host) or host == 'youtu.be':
+        return False
+
+    query_params = parse_qs(parsed.query)
+    is_playlist_path = parsed.path.rstrip('/') == '/playlist'
+    is_list_only = 'list' in query_params and 'v' not in query_params
+    return is_playlist_path or is_list_only
+
+
+def _extract_info(query, options):
+    with _YDL_LOCK:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(query, download=False)
+
+
+def extract_single(query):
+    """Ambil satu lagu (URL video, link YouTube Music, atau teks pencarian)."""
+    info = _extract_info(query, SINGLE_YDL_OPTS)
+    if not info:
+        raise RuntimeError("Sumber tidak ditemukan")
+
+    if info.get('entries') is not None:
+        entries = [entry for entry in info['entries'] if entry]
+        if not entries:
+            raise RuntimeError("Tidak ada hasil yang bisa diputar")
+        info = entries[0]
+
+    return info
+
+
+def extract_playlist(query):
+    """Ambil metadata playlist tanpa mengunduh audio."""
+    info = _extract_info(query, PLAYLIST_YDL_OPTS)
+    if not info:
+        return [], None
+
+    title = info.get('title') or 'Playlist'
+    entries = info.get('entries')
+    if entries is None:
+        return [Track.from_info(info, fallback_url=query)], title
+
+    tracks = []
+    for entry in entries:
+        if not entry or entry.get('_type') in ('playlist', 'multi_video'):
+            continue
+        try:
+            tracks.append(Track.from_info(entry, fallback_url=query))
+        except Exception:
+            continue
+        if len(tracks) >= MAX_QUEUE:
+            break
+
+    return tracks, title
+
+
+@dataclass(slots=True)
+class Track:
+    title: str
+    url: str
+    duration: int | None = None
+    source: str = 'YouTube'
+
+    @classmethod
+    def from_info(cls, info, fallback_url=''):
+        raw_urls = ' '.join(
+            str(info.get(key) or '')
+            for key in ('webpage_url', 'original_url', 'url', 'webpage_url_domain')
+        )
+        raw_url = (
+            info.get('webpage_url')
+            or info.get('original_url')
+            or info.get('url')
+            or fallback_url
+        )
+        url = _normalize_track_url(raw_url, info.get('id'))
+        if not url:
+            raise ValueError("URL lagu tidak ditemukan")
+
+        duration = info.get('duration')
+        try:
+            duration = int(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            duration = None
+
+        source = 'YouTube Music' if 'music.youtube.com' in raw_urls else 'YouTube'
+
+        return cls(
+            title=str(info.get('title') or info.get('fulltitle') or 'Unknown'),
+            url=url,
+            duration=duration,
+            source=source,
+        )
+
+
 class YTDLSource(discord.PCMVolumeTransformer):
     __slots__ = ('data', 'title', 'url', 'duration')
-    
+
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
         self.data = data
@@ -66,17 +213,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.duration = data.get('duration')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=True):
-        loop = loop or asyncio.get_event_loop()
-        # Use shared ytdl instance
-        def extract():
-            return _ytdl.extract_info(url, download=not stream)
-        data = await loop.run_in_executor(None, extract)
-        if 'entries' in data:
-            data = data['entries'][0]
-        data['webpage_url'] = data.get('webpage_url', url)
-        filename = data['url'] if stream else _ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS), data=data)
+    async def from_track(cls, track, *, loop=None):
+        loop = loop or asyncio.get_running_loop()
+        info = await loop.run_in_executor(None, extract_single, track.url)
+        stream_url = info.get('url')
+        if not stream_url:
+            raise RuntimeError("Stream audio tidak ditemukan")
+        return cls(discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS), data=info)
 
 def get_queue(guild_id):
     if guild_id not in queues:
@@ -119,28 +262,39 @@ async def play_next(ctx):
         cleanup_guild(guild_id)
         return
 
-    if not queue:
+    current = getattr(vc, 'current_track', None)
+    is_loop = get_loop_mode(guild_id) == 'song' and current is not None
+    track = current if is_loop else (queue.popleft() if queue else None)
+
+    if track is None:
         await vc.disconnect()
         cleanup_guild(guild_id)
         return
 
-    if get_loop_mode(guild_id) == 'song' and hasattr(vc, 'current_source'):
-        source = vc.current_source
-    else:
-        if hasattr(vc, 'current_source') and vc.current_source:
-            hist.append(vc.current_source)
-        source = queue.popleft()
-        vc.current_source = source
+    try:
+        source = await YTDLSource.from_track(track)
+    except Exception as exc:
+        await ctx.send(f"⚠️ Gagal memutar **{track.title}**: `{exc}`")
+        if is_loop:
+            loop_modes[guild_id] = 'off'
+        await play_next(ctx)
+        return
 
+    if not is_loop and current is not None:
+        hist.append(current)
+
+    vc.current_track = track
+    vc.current_source = source
     vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
 
     embed = discord.Embed(
         title="🎵 Sekarang Diputar",
-        description=f"**[{source.title}]({source.url})**",
+        description=f"**[{track.title}]({track.url})**",
         color=0x00ff00
     )
-    if source.duration:
-        m, s = divmod(source.duration, 60)
+    embed.set_footer(text=f"Sumber: {track.source}")
+    if track.duration:
+        m, s = divmod(track.duration, 60)
         embed.add_field(name="Durasi", value=f"{m}:{s:02d}")
 
     view = MusicPlayerView(ctx)
@@ -291,22 +445,56 @@ async def ensure_voice(ctx):
 @bot.command(aliases=['bjp'])
 async def bj(ctx, *, query: str):
     vc = await ensure_voice(ctx)
-    if not vc: return
-    
+    if not vc:
+        return
+
+    queue = get_queue(ctx.guild.id)
+    if len(queue) >= MAX_QUEUE:
+        return await ctx.send(f"❌ Antrean penuh ({MAX_QUEUE} lagu).")
+
+    loop = asyncio.get_running_loop()
     async with ctx.typing():
         try:
-            source = await YTDLSource.from_url(query, loop=bot.loop, stream=True)
+            if is_playlist_url(query):
+                tracks, playlist_title = await loop.run_in_executor(None, extract_playlist, query)
+            else:
+                info = await loop.run_in_executor(None, extract_single, query)
+                tracks = [Track.from_info(info, fallback_url=query)]
+                playlist_title = None
         except Exception as e:
-            return await ctx.send(f"Error: {e}")
-    
-    queue = get_queue(ctx.guild.id)
-    queue.append(source)
+            return await ctx.send(f"❌ Gagal membaca sumber: `{e}`")
+
+    if not tracks:
+        return await ctx.send("❌ Playlist kosong atau tidak bisa dibaca.")
+
+    space = MAX_QUEUE - len(queue)
+    added = tracks[:space]
+    for track in added:
+        queue.append(track)
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(ctx)
-    else:
-        embed = discord.Embed(title="✅ Ditambahkan", description=f"**[{source.title}]({source.url})**", color=0x00ffff)
+        if len(added) > 1:
+            await ctx.send(f"📋 **{playlist_title}** — {len(added)} lagu masuk antrean.")
+    elif len(added) == 1:
+        track = added[0]
+        embed = discord.Embed(
+            title="✅ Ditambahkan",
+            description=f"**[{track.title}]({track.url})**",
+            color=0x00ffff
+        )
+        embed.set_footer(text=f"Sumber: {track.source}")
         await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(
+            title="📋 Playlist Ditambahkan",
+            description=f"**{playlist_title}**\n{len(added)} lagu masuk antrean.",
+            color=0x00ffff
+        )
+        await ctx.send(embed=embed)
+
+    if len(tracks) > len(added):
+        await ctx.send(f"⚠️ Antrean penuh. Hanya {len(added)} dari {len(tracks)} lagu ditambahkan.")
 
 @bot.command(aliases=['bjs'])
 async def bjx(ctx):
@@ -384,11 +572,17 @@ async def bjprev(ctx):
     queue = get_queue(ctx.guild.id)
     if not hist:
         return await ctx.send("History kosong.")
-    if vc and (vc.is_playing() or vc.is_paused()) and hasattr(vc, 'current_source') and vc.current_source:
-        queue.appendleft(vc.current_source)
+
+    current = getattr(vc, 'current_track', None) if vc else None
+    if current:
+        queue.appendleft(current)
     queue.appendleft(hist.pop())
-    if vc: vc.stop()
-    else: await play_next(ctx)
+
+    loop_modes[ctx.guild.id] = 'off'
+    if vc:
+        vc.stop()
+    else:
+        await play_next(ctx)
     await ctx.send("⏮️ Previous")
 
 @bot.command()
@@ -422,7 +616,7 @@ async def bjregion(ctx, region: str = None):
 def build_help_embed():
     e = discord.Embed(title="🤖 Panduan Bot", description="Command, usage, akses:", color=0x5865F2)
     e.add_field(name="🧹 Clear (Owner Only)", value="`/clear [n]` `!clear [n]` - Hapus pesan\n`/clearuser @u [n]` `!clearuser @u [n]` - Hapus pesan user", inline=False)
-    e.add_field(name="🎵 Music (All Members)", value="`!bj <judul/URL>` - Play/Queue\n`!bjx`/`!bjs` - Skip\n`!bjq`/`!queue` - Queue + buttons\n`!bjpause`/`!bjz` - Pause\n`!bjr` - Resume/Repeat\n`!bjls` - Loop toggle\n`!bjprev` - Previous\n`!bjstop` - Stop & clear\n`!bjdc`/`!bjoff` - Disconnect", inline=False)
+    e.add_field(name="🎵 Music (All Members)", value="`!bj <judul/URL>` - Play/Queue (YouTube & YouTube Music)\n`!bj <link playlist>` - Tambah semua lagu playlist\n`!bjx`/`!bjs` - Skip\n`!bjq`/`!queue` - Queue + buttons\n`!bjpause`/`!bjz` - Pause\n`!bjr` - Resume/Repeat\n`!bjls` - Loop toggle\n`!bjprev` - Previous\n`!bjstop` - Stop & clear\n`!bjdc`/`!bjoff` - Disconnect", inline=False)
     e.add_field(name="⚙️ Audio", value="`!bjbitrate [64-384]` - Set bitrate\n`!bjregion [region]` - Set voice region", inline=False)
     return e
 
